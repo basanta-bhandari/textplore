@@ -6,14 +6,14 @@ import math
 from .colors import attr_for
 from .objects import OBJECTS, contains
 from .settings import BASE_VIEW_DIST, CLOUD_HEIGHT, EYE_OFFSET, FOV_DEG
-from .terrain import BIOME_INFO, OCEAN, classify, noise2
+from .structures import STRUCTURES, contains_structure
+from .terrain import BIOME_INFO, BIOME_NAMES, OCEAN, classify, noise2
 
 
 TERRAIN_RAMP = " .,:;irsXA253hMHGS#9B&@"
 OBJECT_RAMP = " .:-=+*#%@"
-RAY_STEP_COARSE = 1.0
-BISECT_ITERS = 5
-POV_NAMES = ["first-person", "satellite/fisheye", "third-person"]
+BISECT_ITERS = 4
+POV_NAMES = ["1st person · eyes", "2nd person · overhead", "3rd person · chase"]
 
 # A high, angled sun makes slopes readable in monochrome as well as color.
 _LIGHT = (-0.42, -0.32, 0.848)
@@ -22,12 +22,15 @@ _LIGHT = (-0.42, -0.32, 0.848)
 def _frame_caches(cache):
     if cache is None:
         cache = {}
-    return (
-        cache.setdefault("columns", {}),
-        cache.setdefault("objects", {}),
-        cache.setdefault("object_bases", {}),
-        cache.setdefault("spatial_objects", {}),
-    )
+    cache.setdefault("columns", {})
+    cache.setdefault("objects", {})
+    cache.setdefault("object_bases", {})
+    cache.setdefault("spatial_objects", {})
+    cache.setdefault("structures", {})
+    cache.setdefault("structure_bases", {})
+    cache.setdefault("spatial_structures", {})
+    cache.setdefault("biomes", {})
+    return cache
 
 
 def _column_at(world, grid_x, grid_y, column_cache):
@@ -102,12 +105,92 @@ def _object_hit(
     return None
 
 
+def _structure_at(world, grid_x, grid_y, structure_cache):
+    key = (grid_x, grid_y)
+    if key not in structure_cache:
+        structure_cache[key] = world.structure_at(grid_x, grid_y)
+    return structure_cache[key]
+
+
+def _structures_in_cell(world, cell_x, cell_y, structure_cache, spatial_cache):
+    key = (cell_x, cell_y)
+    if key in spatial_cache:
+        return spatial_cache[key]
+
+    candidates = []
+    for grid_y in range(cell_y - 2, cell_y + 3):
+        for grid_x in range(cell_x - 2, cell_x + 3):
+            structure = _structure_at(world, grid_x, grid_y, structure_cache)
+            if structure is None:
+                continue
+            structure_x, structure_y = world.structure_position(grid_x, grid_y)
+            radius = STRUCTURES[structure]["radius"]
+            if (
+                structure_x + radius >= cell_x
+                and structure_x - radius <= cell_x + 1
+                and structure_y + radius >= cell_y
+                and structure_y - radius <= cell_y + 1
+            ):
+                candidates.append(
+                    (grid_x, grid_y, structure, structure_x, structure_y, radius)
+                )
+    spatial_cache[key] = candidates
+    return candidates
+
+
+def _structure_hit(
+    world, x, y, z, column_cache, structure_cache, base_cache, spatial_cache
+):
+    cell_x, cell_y = math.floor(x), math.floor(y)
+    candidates = _structures_in_cell(
+        world, cell_x, cell_y, structure_cache, spatial_cache
+    )
+    for grid_x, grid_y, structure, structure_x, structure_y, radius in candidates:
+        if abs(x - structure_x) > radius or abs(y - structure_y) > radius:
+            continue
+        key = (grid_x, grid_y)
+        if key not in base_cache:
+            base_cache[key] = _surface_at(world, structure_x, structure_y, column_cache)
+        if contains_structure(
+            structure, x - structure_x, y - structure_y, z - base_cache[key]
+        ):
+            return structure
+    return None
+
+
+def _feature_hit(world, x, y, z, cache):
+    obj = _object_hit(
+        world,
+        x,
+        y,
+        z,
+        cache["columns"],
+        cache["objects"],
+        cache["object_bases"],
+        cache["spatial_objects"],
+    )
+    if obj:
+        return "object", obj
+    structure = _structure_hit(
+        world,
+        x,
+        y,
+        z,
+        cache["columns"],
+        cache["structures"],
+        cache["structure_bases"],
+        cache["spatial_structures"],
+    )
+    if structure:
+        return "structure", structure
+    return None, None
+
+
 def _is_solid(world, x, y, z, frame_cache):
-    columns, objects, bases, spatial = _frame_caches(frame_cache)
-    if z <= _surface_at(world, x, y, columns):
+    if z <= _surface_at(world, x, y, frame_cache["columns"]):
         return True, None
-    obj = _object_hit(world, x, y, z, columns, objects, bases, spatial)
-    return obj is not None, obj
+    feature_kind, feature = _feature_hit(world, x, y, z, frame_cache)
+    return feature is not None, (feature_kind, feature)
 
 
 def _surface_light(world, x, y, column_cache):
@@ -126,6 +209,15 @@ def _surface_light(world, x, y, column_cache):
     return 0.22 + diffuse * 0.78
 
 
+def _biome_at(world, x, y, biome_cache):
+    """Cache biome color at quarter-unit resolution across adjacent rays."""
+    key = (round(x * 4), round(y * 4))
+    if key not in biome_cache:
+        sample_x, sample_y = key[0] / 4.0, key[1] / 4.0
+        biome_cache[key] = classify(sample_x, sample_y, world.seed)[:2]
+    return biome_cache[key]
+
+
 def raymarch_pixel(
     world,
     origin_x,
@@ -141,11 +233,17 @@ def raymarch_pixel(
     dx = math.cos(yaw) * math.cos(pitch)
     dy = math.sin(yaw) * math.cos(pitch)
     dz = math.sin(pitch)
-    cache = frame_cache if frame_cache is not None else {}
+    cache = _frame_caches(frame_cache)
 
     distance = 0.0
     while distance < max_dist:
-        distance += RAY_STEP_COARSE
+        previous_distance = distance
+        if distance < 6.0:
+            distance += 0.8
+        elif distance < 14.0:
+            distance += 1.25
+        else:
+            distance += 1.75
         ray_x = origin_x + dx * distance
         ray_y = origin_y + dy * distance
         ray_z = origin_z + dz * distance
@@ -156,7 +254,7 @@ def raymarch_pixel(
         if not solid:
             continue
 
-        low, high = distance - RAY_STEP_COARSE, distance
+        low, high = previous_distance, distance
         for _ in range(BISECT_ITERS):
             middle = (low + high) * 0.5
             mid_x = origin_x + dx * middle
@@ -171,13 +269,12 @@ def raymarch_pixel(
         hit_x = origin_x + dx * high
         hit_y = origin_y + dy * high
         hit_z = origin_z + dz * high
-        columns, objects, bases, spatial = _frame_caches(cache)
-        obj = _object_hit(world, hit_x, hit_y, hit_z, columns, objects, bases, spatial)
-        if obj:
-            return high, "object", obj, None
+        feature_kind, feature = _feature_hit(world, hit_x, hit_y, hit_z, cache)
+        if feature:
+            return high, feature_kind, feature, None
 
-        biome, elevation, _dipped = classify(hit_x, hit_y, world.seed)
-        light = _surface_light(world, hit_x, hit_y, columns)
+        biome, elevation = _biome_at(world, hit_x, hit_y, cache["biomes"])
+        light = _surface_light(world, hit_x, hit_y, cache["columns"])
         return high, "ground", biome, (elevation, light)
 
     return max_dist, None, None, None
@@ -192,14 +289,32 @@ def _pov_glyph(kind, key, closeness, extra):
         return glyph, attr_for(BIOME_INFO[key]["ckey"], brightness > 0.72)
 
     index = min(len(OBJECT_RAMP) - 1, int((0.3 + closeness * 0.7) * (len(OBJECT_RAMP) - 1)))
+    if kind == "structure":
+        return OBJECT_RAMP[index], attr_for(STRUCTURES[key]["ckey"], closeness > 0.55)
     return OBJECT_RAMP[index], attr_for(OBJECTS[key]["ckey"], closeness > 0.55)
 
 
+def _record_visible(visible, color_key, glyph, label):
+    visible.setdefault((color_key, label), set()).add(glyph)
+
+
 def render_raymarch(
-    stdscr, world, origin_x, origin_y, origin_z, yaw, pitch, width, height, y_origin, cloud_time
+    stdscr,
+    world,
+    origin_x,
+    origin_y,
+    origin_z,
+    yaw,
+    pitch,
+    width,
+    height,
+    y_origin,
+    cloud_time,
+    marker="crosshair",
 ):
     half_fov = FOV_DEG / 2
-    frame_cache = {}
+    frame_cache = _frame_caches({})
+    visible = {}
     glyph_rows = [[" "] * width for _ in range(height)]
     attribute_rows = [[0] * width for _ in range(height)]
     for column in range(width):
@@ -222,15 +337,35 @@ def render_raymarch(
                 cloud_y = origin_y + math.sin(math.radians(ray_yaw)) * 8
                 cloudy = noise2(cloud_x, cloud_y, world.seed + 4242, octaves=2, scale=0.06) > 0.6
                 glyph = "#" if kind == "sky" and cloudy else " "
-                attribute = attr_for("cloud" if cloudy and kind == "sky" else "sky")
+                color_key = "cloud" if cloudy and kind == "sky" else "sky"
+                attribute = attr_for(color_key)
+                _record_visible(visible, color_key, glyph, "cloud" if color_key == "cloud" else "sky")
             else:
                 closeness = 1.0 - min(distance / BASE_VIEW_DIST, 1.0)
                 glyph, attribute = _pov_glyph(kind, key, closeness, extra)
+                if kind == "ground":
+                    _record_visible(visible, BIOME_INFO[key]["ckey"], glyph, BIOME_NAMES[key])
+                elif kind == "structure":
+                    _record_visible(visible, STRUCTURES[key]["ckey"], glyph, STRUCTURES[key]["label"])
+                else:
+                    _record_visible(visible, OBJECTS[key]["ckey"], glyph, OBJECTS[key]["label"])
 
             glyph_rows[row][column] = glyph
             attribute_rows[row][column] = attribute
 
+    marker_row, marker_column = height // 2, width // 2
+    if marker == "player":
+        marker_row = min(height - 1, height * 2 // 3)
+        glyph_rows[marker_row][marker_column] = "@"
+        attribute_rows[marker_row][marker_column] = attr_for("player", True)
+        _record_visible(visible, "player", "@", "you (chase camera)")
+    elif marker == "crosshair":
+        glyph_rows[marker_row][marker_column] = "+"
+        attribute_rows[marker_row][marker_column] = attr_for("ui", True)
+        _record_visible(visible, "ui", "+", "crosshair")
+
     _flush_cell_buffer(stdscr, glyph_rows, attribute_rows, y_origin)
+    return visible
 
 
 def _flush_cell_buffer(stdscr, glyph_rows, attribute_rows, y_origin):
@@ -256,16 +391,26 @@ def _flush_cell_buffer(stdscr, glyph_rows, attribute_rows, y_origin):
 def render_topdown(stdscr, world, player, width, height, y_origin, stride=1):
     glyph_rows = [[" "] * width for _ in range(height)]
     attribute_rows = [[0] * width for _ in range(height)]
+    visible = {}
     for row in range(height):
         for column in range(width):
             world_x = player.x + (column - width // 2) * stride
             world_y = player.y + (row - height // 2) * stride * 1.65
             if column == width // 2 and row == height // 2:
                 glyph, attribute = "@", attr_for("player")
+                _record_visible(visible, "player", glyph, "you (overhead)")
             else:
-                obj = world.object_at(math.floor(world_x), math.floor(world_y))
-                if obj:
+                grid_x, grid_y = math.floor(world_x), math.floor(world_y)
+                structure = world.structure_at(grid_x, grid_y)
+                obj = world.object_at(grid_x, grid_y)
+                if structure:
+                    glyph = {"cave entrance": "O", "dungeon": "D", "lighthouse": "L"}[structure]
+                    color_key = STRUCTURES[structure]["ckey"]
+                    attribute = attr_for(color_key, True)
+                    _record_visible(visible, color_key, glyph, STRUCTURES[structure]["label"])
+                elif obj:
                     glyph, attribute = "o", attr_for(OBJECTS[obj]["ckey"])
+                    _record_visible(visible, OBJECTS[obj]["ckey"], glyph, OBJECTS[obj]["label"])
                 else:
                     _surface, biome, elevation = world.surface_details_at(world_x, world_y)
                     normal = world.surface_normal_at(world_x, world_y)
@@ -280,10 +425,12 @@ def render_topdown(stdscr, world, player, width, height, y_origin, stride=1):
                     )
                     glyph = "~" if biome == OCEAN and index > 4 else TERRAIN_RAMP[index]
                     attribute = attr_for(BIOME_INFO[biome]["ckey"], brightness > 0.72)
+                    _record_visible(visible, BIOME_INFO[biome]["ckey"], glyph, BIOME_NAMES[biome])
             glyph_rows[row][column] = glyph
             attribute_rows[row][column] = attribute
 
     _flush_cell_buffer(stdscr, glyph_rows, attribute_rows, y_origin)
+    return visible
 
 
 def third_person_origin(player):

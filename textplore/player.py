@@ -22,7 +22,7 @@ class Player:
         distance = MOVE_STEP * (1 if forward else -0.5)
         next_x = self.x + math.cos(radians) * distance
         next_y = self.y + math.sin(radians) * distance
-        if world.blocking_object_at(next_x, next_y):
+        if world.blocking_object_at(next_x, next_y) or world.blocking_structure_at(next_x, next_y):
             return "blocked"
 
         target_height = world.surface_at(next_x, next_y)

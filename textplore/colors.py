@@ -22,7 +22,6 @@ EXTENDED_PALETTE = {
     "berry": (197, False),
     "fiber": (229, False),
     "clay": (173, False),
-    "fiber": (229, False),
     "herb": (76, False),
     "mushroom": (201, False),
     "coal": (240, False),
@@ -51,7 +50,6 @@ BASE_PALETTE = {
     "berry": ("RED", False),
     "fiber": ("YELLOW", False),
     "clay": ("RED", True),
-    "fiber": ("YELLOW", False),
     "herb": ("GREEN", True),
     "mushroom": ("MAGENTA", False),
     "coal": ("BLACK", True),
@@ -62,23 +60,6 @@ BASE_PALETTE = {
     "ui": ("WHITE", False),
     "player": ("GREEN", True),
 }
-
-LEGEND_ITEMS = [
-    ("ocean", "~", "ocean/lake"),
-    ("plains", ",", "plains"),
-    ("grassland", ".", "grassland"),
-    ("forest", '"', "forest"),
-    ("mountain", "^", "mountain"),
-    ("peak", "A", "peak/snow"),
-    ("cave", ":", "cave"),
-    ("wood", "T", "tree"),
-    ("stone", "#", "rock"),
-    ("ore", "*", "ore"),
-    ("berry", "o", "berries"),
-    ("clay", "%", "clay"),
-    ("cloud", "#", "cloud (sky)"),
-]
-
 
 def init_colors():
     COLOR_NAME_TO_PAIR.clear()
@@ -115,17 +96,27 @@ def attr_for(name, extra_bold=False):
     return curses.color_pair(pair) | bold | (curses.A_BOLD if extra_bold else 0)
 
 
-def render_legend(stdscr, max_y, max_x, legend_width):
+def render_legend(stdscr, max_y, max_x, legend_width, visible_items):
+    """Render only glyph/color meanings present in the current view."""
     x_origin = max_x - legend_width
     if x_origin < 0:
         return
     try:
-        stdscr.addstr(0, x_origin, "-- legend --"[:legend_width])
-        for index, (color_key, glyph, label) in enumerate(LEGEND_ITEMS):
-            row = 1 + index
+        stdscr.addstr(0, x_origin, "-- visible index --"[:legend_width], attr_for("ui", True))
+        row = 1
+        for (color_key, label), glyphs in visible_items.items():
             if row >= max_y - 1:
                 break
-            stdscr.addstr(row, x_origin, glyph, attr_for(color_key))
-            stdscr.addstr(row, x_origin + 2, label[: legend_width - 3])
+            shown = "".join(sorted(glyphs)).replace(" ", "␠")
+            glyph_width = min(12, max(1, legend_width // 2))
+            chunks = [shown[index : index + glyph_width] for index in range(0, len(shown), glyph_width)]
+            for chunk_index, chunk in enumerate(chunks or ["?"]):
+                if row >= max_y - 1:
+                    break
+                stdscr.addstr(row, x_origin, chunk[:glyph_width], attr_for(color_key))
+                if chunk_index == 0:
+                    label_x = x_origin + glyph_width + 1
+                    stdscr.addstr(row, label_x, label[: max(0, legend_width - glyph_width - 1)])
+                row += 1
     except curses.error:
         pass

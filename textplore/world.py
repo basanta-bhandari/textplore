@@ -4,11 +4,14 @@ import math
 
 from .objects import OBJECTS
 from .settings import CHUNK_SIZE, SEED
+from .structures import STRUCTURES
 from .terrain import (
+    CAVE,
     FOREST,
     GRASSLAND,
     MOUNTAIN,
     PEAK,
+    OCEAN,
     PLAINS,
     classify,
     hash_value,
@@ -17,12 +20,13 @@ from .terrain import (
 
 
 class Chunk:
-    __slots__ = ("height", "biome", "objects")
+    __slots__ = ("height", "biome", "objects", "structures")
 
     def __init__(self):
         self.height = {}
         self.biome = {}
         self.objects = {}
+        self.structures = {}
 
 
 class World:
@@ -54,16 +58,54 @@ class World:
                 chunk.biome[key] = (biome, elevation)
 
                 roll = hash_value(grid_x, grid_y, self.seed + 7)
-                if biome == FOREST and roll < 0.14:
+                structure_roll = hash_value(grid_x, grid_y, self.seed + 1701)
+                if biome in (MOUNTAIN, PEAK, CAVE) and structure_roll < 0.004:
+                    chunk.structures[key] = "cave entrance"
+                    continue
+                if biome in (PLAINS, GRASSLAND) and structure_roll < 0.0003:
+                    coast = any(
+                        classify(grid_x + dx, grid_y + dy, self.seed)[0] == OCEAN
+                        for dx, dy in ((-3, 0), (3, 0), (0, -3), (0, 3))
+                    )
+                    if coast:
+                        chunk.structures[key] = "lighthouse"
+                        continue
+                if biome in (PLAINS, GRASSLAND, FOREST, MOUNTAIN) and structure_roll < 0.0012:
+                    chunk.structures[key] = "dungeon"
+                    continue
+
+                if biome == FOREST and roll < 0.12:
                     chunk.objects[key] = "tree"
+                elif biome == FOREST and roll < 0.16:
+                    chunk.objects[key] = "mushroom"
+                elif biome == FOREST and roll < 0.19:
+                    chunk.objects[key] = "herb"
+                elif biome == FOREST and roll < 0.22:
+                    chunk.objects[key] = "fiber"
                 elif biome in (MOUNTAIN, PEAK) and roll < 0.09:
                     chunk.objects[key] = "rock"
-                elif biome in (MOUNTAIN, PEAK) and 0.09 <= roll < 0.105:
+                elif biome in (MOUNTAIN, PEAK) and roll < 0.105:
                     chunk.objects[key] = "ore"
-                elif biome in (GRASSLAND, PLAINS) and roll < 0.05:
+                elif biome in (MOUNTAIN, PEAK) and roll < 0.13:
+                    chunk.objects[key] = "coal"
+                elif biome in (MOUNTAIN, PEAK) and roll < 0.136:
+                    chunk.objects[key] = "crystal"
+                elif biome == CAVE and roll < 0.08:
+                    chunk.objects[key] = "mushroom"
+                elif biome == CAVE and roll < 0.14:
+                    chunk.objects[key] = "coal"
+                elif biome == CAVE and roll < 0.16:
+                    chunk.objects[key] = "crystal"
+                elif biome in (GRASSLAND, PLAINS) and roll < 0.04:
                     chunk.objects[key] = "berry"
-                elif biome == PLAINS and 0.05 <= roll < 0.07:
+                elif biome == PLAINS and roll < 0.065:
                     chunk.objects[key] = "clay"
+                elif biome == PLAINS and roll < 0.09:
+                    chunk.objects[key] = "sand"
+                elif biome in (GRASSLAND, PLAINS) and roll < 0.16:
+                    chunk.objects[key] = "fiber"
+                elif biome in (GRASSLAND, PLAINS) and roll < 0.185:
+                    chunk.objects[key] = "herb"
         return chunk
 
     def _local(self, x, y):
@@ -82,6 +124,10 @@ class World:
     def object_at(self, x, y):
         chunk, local_x, local_y = self._local(x, y)
         return chunk.objects.get((local_x, local_y))
+
+    def structure_at(self, x, y):
+        chunk, local_x, local_y = self._local(x, y)
+        return chunk.structures.get((local_x, local_y))
 
     def column_at(self, x, y):
         """Fetch height, object, biome, and elevation with one chunk lookup."""
@@ -127,6 +173,11 @@ class World:
         jitter_y = (hash_value(grid_x, grid_y, self.seed + 163) - 0.5) * 0.5
         return grid_x + 0.5 + jitter_x, grid_y + 0.5 + jitter_y
 
+    def structure_position(self, grid_x, grid_y):
+        jitter_x = (hash_value(grid_x, grid_y, self.seed + 809) - 0.5) * 0.3
+        jitter_y = (hash_value(grid_x, grid_y, self.seed + 907) - 0.5) * 0.3
+        return grid_x + 0.5 + jitter_x, grid_y + 0.5 + jitter_y
+
     def nearby_objects(self, x, y, radius):
         cell_radius = math.ceil(radius + 1.0)
         center_x, center_y = math.floor(x), math.floor(y)
@@ -149,3 +200,16 @@ class World:
     def nearest_object(self, x, y, radius=1.5):
         candidates = list(self.nearby_objects(x, y, radius))
         return min(candidates, default=None, key=lambda candidate: candidate[0])
+
+    def blocking_structure_at(self, x, y, player_radius=0.18):
+        center_x, center_y = math.floor(x), math.floor(y)
+        for grid_y in range(center_y - 2, center_y + 3):
+            for grid_x in range(center_x - 2, center_x + 3):
+                structure = self.structure_at(grid_x, grid_y)
+                if structure is None:
+                    continue
+                structure_x, structure_y = self.structure_position(grid_x, grid_y)
+                radius = STRUCTURES[structure]["radius"]
+                if math.hypot(x - structure_x, y - structure_y) < radius + player_radius:
+                    return structure
+        return None
